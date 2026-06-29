@@ -220,7 +220,7 @@ const CAT = {
 const fmt = n => "$" + Math.round(n).toLocaleString("en-US");
 
 /* ── Search ── */
-let _st;
+let _st, _searchSeq = 0;
 document.getElementById("search").addEventListener("input", e => {
   clearTimeout(_st);
   _st = setTimeout(() => doSearch(e.target.value.trim()), 220);
@@ -231,10 +231,12 @@ async function doSearch(q) {
   if (!q) { el.innerHTML = '<div class="empty">Type to search entities and donors</div>'; return; }
   el.innerHTML = '<div class="loading">Searching…</div>';
 
+  const seq = ++_searchSeq;
   const [entities, donors] = await Promise.all([
     apiFetch(`/api/search?q=${enc(q)}&limit=30`),
     apiFetch(`/api/donor/search?q=${enc(q)}&limit=30`),
   ]);
+  if (seq !== _searchSeq) return; // stale — a newer search already fired
 
   el.innerHTML = "";
 
