@@ -1,0 +1,12 @@
+utah_disclosures.db
+*.csv
+*.pyc
+__pycache__/
+.env
+*.log
+repair_geocode*.py
+build_*.py
+clean_addresses.py
+geocode_donors.py
+scrape.py
+GeocodeMap.gs

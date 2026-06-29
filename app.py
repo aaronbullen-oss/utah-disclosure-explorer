@@ -1,0 +1,314 @@
+"""
+Utah Disclosure Explorer — FastAPI backend
+Usage: uvicorn app:app --reload
+Then open http://localhost:8000
+"""
+
+from contextlib import asynccontextmanager
+from fastapi import FastAPI
+from fastapi.responses import FileResponse
+from fastapi.middleware.cors import CORSMiddleware
+from difflib import SequenceMatcher
+import sqlite3, re, asyncio, urllib.request, os
+from pathlib import Path
+
+BASE = "https://disclosures.utah.gov"
+_officer_cache: dict[str, list] = {}
+
+DB   = Path(__file__).parent / "utah_disclosures.db"
+HTML = Path(__file__).parent / "index.html"
+
+# Google Drive file ID for the SQLite database.
+# Set DB_DRIVE_ID env var on Render, or hardcode after uploading.
+DB_DRIVE_ID = os.environ.get("DB_DRIVE_ID", "")
+
+_lookup: dict[str, str] = {}   # normalized name -> entity_id
+_names:  dict[str, str] = {}   # entity_id -> display name
+
+def _norm(name: str) -> str:
+    """Normalize an entity name for fuzzy matching."""
+    n = re.sub(r"[',\.\-]", " ", name.lower().strip())
+    n = re.sub(r"\b(inc|llc|ltd|co|corp|corporation|incorporated|company|companies|the)\b", "", n)
+    return re.sub(r"\s+", " ", n).strip()
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    if not DB.exists():
+        if not DB_DRIVE_ID:
+            raise RuntimeError("DB not found and DB_DRIVE_ID env var not set")
+        print(f"Downloading database from Google Drive ({DB_DRIVE_ID})...")
+        import gdown
+        gdown.download(id=DB_DRIVE_ID, output=str(DB), quiet=False)
+        print("Download complete.")
+    con = sqlite3.connect(DB)
+    for eid, name in con.execute("SELECT entity_id, name FROM entities"):
+        _names[str(eid)] = name
+        _lookup[_norm(name)] = str(eid)
+    # Indexes for performance (no-op if already exist)
+    con.executescript("""
+        CREATE INDEX IF NOT EXISTS idx_t_entity   ON transactions(entity_id);
+        CREATE INDEX IF NOT EXISTS idx_t_type     ON transactions(tran_type);
+        CREATE INDEX IF NOT EXISTS idx_t_namelc   ON transactions(LOWER(TRIM(name)));
+        CREATE INDEX IF NOT EXISTS idx_t_amount   ON transactions(tran_amount);
+    """)
+    con.commit()
+    con.close()
+    yield
+
+app = FastAPI(lifespan=lifespan)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["GET"],
+    allow_headers=["*"],
+)
+
+def _db() -> sqlite3.Connection:
+    c = sqlite3.connect(DB)
+    c.row_factory = sqlite3.Row
+    return c
+
+def _search_patterns(q: str) -> list[str]:
+    """Return LIKE patterns for a query, adding a reversed 'Last, First' variant
+    when the query looks like 'First Last' (two words, no comma)."""
+    patterns = [f"%{q}%"]
+    parts = q.strip().split()
+    if len(parts) == 2 and "," not in q:
+        patterns.append(f"%{parts[1]}, {parts[0]}%")
+    return patterns
+
+
+def resolve(name: str) -> str | None:
+    """Return entity_id if this donor name matches a known entity, else None."""
+    return _lookup.get(_norm(name))
+
+
+def _name_variants(name: str, con: sqlite3.Connection, threshold: float = 0.92) -> list[str]:
+    """Return all donor name variants in the DB that are similar to `name`.
+
+    Uses the first word as a prefix filter to limit candidates, then applies
+    SequenceMatcher so minor typos (e.g. 'Goverment' vs 'Government') are caught.
+    """
+    first_word = re.split(r"\W+", name.strip())[0]
+    candidates = con.execute(
+        "SELECT DISTINCT name FROM transactions WHERE name LIKE ? AND tran_type='Contribution'",
+        (f"{first_word}%",),
+    ).fetchall()
+    name_lc = name.lower().strip()
+    matches = [
+        c[0] for c in candidates
+        if SequenceMatcher(None, name_lc, c[0].lower().strip()).ratio() >= threshold
+    ]
+    return matches or [name]
+
+
+@app.get("/api/search")
+def search(q: str = "", limit: int = 40):
+    if not q:
+        return []
+    patterns = _search_patterns(q)
+    where = " OR ".join("name LIKE ?" for _ in patterns)
+    con = _db()
+    rows = con.execute(
+        f"SELECT entity_id, name, category_slug FROM entities WHERE ({where}) ORDER BY name LIMIT ?",
+        patterns + [limit],
+    ).fetchall()
+    con.close()
+    return [dict(r) for r in rows]
+
+
+@app.get("/api/entity/{entity_id}/donors")
+def entity_donors(entity_id: str):
+    con = _db()
+    ent = con.execute(
+        "SELECT entity_id, name, category_slug, folder_id FROM entities WHERE entity_id=?",
+        (entity_id,),
+    ).fetchone()
+    if not ent:
+        con.close()
+        return {"error": "Entity not found"}
+
+    rows = con.execute("""
+        SELECT name,
+               SUM(tran_amount) AS total,
+               COUNT(*)         AS gifts,
+               MAX(address1)    AS addr,
+               MAX(city)        AS city,
+               MAX(state)       AS state
+        FROM   transactions
+        WHERE  entity_id = ?
+          AND  tran_type = 'Contribution'
+          AND  tran_amount > 0
+        GROUP  BY LOWER(TRIM(name))
+        ORDER  BY total DESC
+    """, (entity_id,)).fetchall()
+    con.close()
+
+    donors = []
+    for r in rows:
+        addr = ", ".join(p for p in [r["addr"] or "", r["city"] or "", r["state"] or ""] if p)
+        donors.append({
+            "name":             r["name"],
+            "total":            r["total"],
+            "gifts":            r["gifts"],
+            "address":          addr,
+            "linked_entity_id": resolve(r["name"]),
+        })
+
+    return {
+        "entity_id":   str(ent["entity_id"]),
+        "name":        ent["name"],
+        "category":    ent["category_slug"],
+        "folder_id":   ent["folder_id"],
+        "total_raised": sum(d["total"] for d in donors),
+        "donors":      donors,
+    }
+
+
+@app.get("/api/donor/search")
+def donor_search(q: str = "", limit: int = 40):
+    if not q:
+        return []
+    patterns = _search_patterns(q)
+    where = " OR ".join("name LIKE ?" for _ in patterns)
+    con = _db()
+    rows = con.execute(f"""
+        SELECT name,
+               SUM(tran_amount)  AS total,
+               COUNT(*)          AS gifts,
+               MAX(address1)     AS addr,
+               MAX(city)         AS city,
+               MAX(state)        AS state
+        FROM   transactions
+        WHERE  ({where}) AND tran_type = 'Contribution' AND tran_amount > 0
+        GROUP  BY LOWER(TRIM(name))
+        ORDER  BY total DESC
+        LIMIT  ?
+    """, patterns + [limit]).fetchall()
+    con.close()
+    return [{
+        "name":             r["name"],
+        "total":            r["total"],
+        "gifts":            r["gifts"],
+        "address":          ", ".join(p for p in [r["addr"] or "", r["city"] or "", r["state"] or ""] if p),
+        "linked_entity_id": resolve(r["name"]),
+    } for r in rows]
+
+
+@app.get("/api/donor/given")
+def donor_given(name: str):
+    con = _db()
+    variants = _name_variants(name, con)
+    placeholders = ",".join("?" * len(variants))
+    rows = con.execute(f"""
+        SELECT e.entity_id,
+               e.name          AS entity_name,
+               e.category_slug AS category,
+               SUM(t.tran_amount) AS total,
+               COUNT(*)           AS gifts,
+               MAX(t.tran_date)   AS last_date
+        FROM   transactions t
+        JOIN   entities e ON t.entity_id = e.entity_id
+        WHERE  t.name IN ({placeholders})
+          AND  t.tran_type = 'Contribution'
+          AND  t.tran_amount > 0
+        GROUP  BY e.entity_id
+        ORDER  BY total DESC
+    """, variants).fetchall()
+    con.close()
+    return {
+        "name":             name,
+        "linked_entity_id": resolve(name),
+        "given":            [dict(r) for r in rows],
+    }
+
+
+def _fetch_officers_sync(entity_id: str) -> list[dict]:
+    """Fetch officer info from /Registration/EntityDetails/{entity_id}.
+
+    Page structure: <fieldset><legend>Information about the X</legend>
+    followed by <div class="dis-cell"><label>Field</label>Value</div> rows.
+    """
+    url = f"{BASE}/Registration/EntityDetails/{entity_id}"
+    req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+    try:
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            html = resp.read().decode("utf-8", errors="replace")
+    except Exception as e:
+        return [{"error": str(e)}]
+
+    html = re.sub(r'<(?:script|style)[^>]*>.*?</(?:script|style)>', '', html, flags=re.DOTALL | re.I)
+
+    def strip_tags(s):
+        return re.sub(r'\s+', ' ', re.sub(r'<[^>]+>', ' ', s)).strip()
+
+    officers = []
+    for fs in re.finditer(r'<fieldset[^>]*>(.*?)</fieldset>', html, re.DOTALL | re.I):
+        fs_html = fs.group(1)
+        leg = re.search(r'<legend[^>]*>([^<]+)</legend>', fs_html, re.I)
+        if not leg:
+            continue
+        # Only process fieldsets that have a person's Last name field
+        if not re.search(r'<label[^>]*>\s*Last\s*</label>', fs_html, re.I):
+            continue
+
+        role = re.sub(r'(?i)information about (the )?', '', leg.group(1)).strip()
+
+        fields: dict[str, str] = {}
+        for cell in re.finditer(
+            r'<div[^>]*class="[^"]*dis-cell[^"]*"[^>]*>(.*?)</div>',
+            fs_html, re.DOTALL | re.I,
+        ):
+            cell_html = cell.group(1)
+            lbl = re.search(r'<label[^>]*>([^<]+)</label>', cell_html, re.I)
+            if not lbl:
+                continue
+            label = lbl.group(1).strip()
+            value = strip_tags(re.sub(r'<label[^>]*>[^<]*</label>', '', cell_html, flags=re.I))
+            if value:
+                fields[label] = value
+
+        name = " ".join(fields[k] for k in ("First", "Middle", "Last", "Suffix") if fields.get(k))
+        addr = ", ".join(filter(None, [
+            fields.get("Street Address", ""),
+            fields.get("Suite/PO Box", ""),
+            fields.get("City", ""),
+            " ".join(filter(None, [fields.get("State", ""), fields.get("Zip", "")])),
+        ]))
+
+        officer: dict[str, str] = {"role": role}
+        if name:    officer["name"]    = name
+        if addr:    officer["address"] = addr
+        if fields.get("Phone"): officer["phone"] = fields["Phone"]
+        if fields.get("Email"): officer["email"] = fields["Email"]
+        officers.append(officer)
+
+    return officers
+
+
+@app.get("/api/entity/{entity_id}/officers")
+async def entity_officers(entity_id: str):
+    con = _db()
+    ent = con.execute(
+        "SELECT name, folder_id FROM entities WHERE entity_id=?", (entity_id,)
+    ).fetchone()
+    con.close()
+    if not ent:
+        return {"error": "not found", "officers": []}
+
+    filing_url = f"{BASE}/Search/PublicSearch/FolderDetails/{ent['folder_id']}"
+
+    if entity_id not in _officer_cache:
+        _officer_cache[entity_id] = await asyncio.to_thread(_fetch_officers_sync, entity_id)
+
+    return {
+        "name":       ent["name"],
+        "filing_url": filing_url,
+        "officers":   _officer_cache[entity_id],
+    }
+
+
+@app.get("/")
+def index():
+    return FileResponse(HTML)
