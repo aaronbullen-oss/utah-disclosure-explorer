@@ -101,6 +101,14 @@ html, body { height: 100%; font-family: system-ui, -apple-system, sans-serif; fo
 .d-amt       { flex-shrink: 0; text-align: right; }
 .d-total     { font-size: 13px; font-weight: 600; white-space: nowrap; }
 .d-gifts     { font-size: 11px; color: var(--text2); }
+.date-toggle { background: none; border: none; font-size: 10px; color: var(--accent); cursor: pointer; padding: 1px 0 0; display: block; }
+.date-toggle:hover { text-decoration: underline; }
+.date-list   { display: none; margin-top: 3px; }
+.date-list.open { display: block; }
+.date-item   { display: flex; justify-content: space-between; gap: 8px; font-size: 11px; color: var(--text2); padding: 1px 0; }
+.di-date     { color: var(--text2); }
+.di-amt      { font-weight: 600; color: var(--text); white-space: nowrap; }
+.s-date      { display: block; font-size: 11px; color: var(--text2); font-weight: 400; }
 
 /* ── Expanded section ── */
 .d-expanded  { display: none; background: var(--bg2); border-top: 1px solid var(--border); }
@@ -124,7 +132,7 @@ html, body { height: 100%; font-family: system-ui, -apple-system, sans-serif; fo
 .s-xbtn.open { transform: rotate(90deg); }
 .s-name      { flex: 1; font-size: 13px; font-weight: 500; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .s-cat       { font-size: 11px; color: var(--text2); flex-shrink: 0; }
-.s-amt       { font-size: 13px; font-weight: 600; flex-shrink: 0; white-space: nowrap; }
+.s-amt       { font-size: 13px; font-weight: 600; flex-shrink: 0; text-align: right; }
 
 .s-inline    { border-top: 1px solid var(--border); background: var(--bg2); padding: 10px 11px 10px 27px; }
 .s-inline-label { font-size: 11px; font-weight: 600; letter-spacing: 0.05em; text-transform: uppercase; color: var(--text2); margin-bottom: 6px; }
@@ -218,6 +226,13 @@ const CAT = {
   PAC:"PAC", PIC:"Political Issues Committee", PARTY:"Political Party",
 };
 const fmt = n => "$" + Math.round(n).toLocaleString("en-US");
+function fmtDate(d) {
+  if (!d) return "";
+  // handles "MM/DD/YYYY" and "YYYY-MM-DD"
+  const [a, b, c] = d.split(/[-\/]/);
+  const dt = a.length === 4 ? new Date(+a, +b - 1, +c) : new Date(+c, +a - 1, +b);
+  return isNaN(dt) ? d : dt.toLocaleDateString("en-US", {month:"short", day:"numeric", year:"numeric"});
+}
 
 /* ── Search ── */
 let _st, _searchSeq = 0;
@@ -314,7 +329,7 @@ async function loadEntity(entityId) {
 
   const list = mk("div", "donor-list");
   view.appendChild(list);
-  renderDonorRows(data.donors, data.total_raised, list, new Set([String(entityId)]), 0);
+  renderDonorRows(data.donors, data.total_raised, list, new Set([String(entityId)]), 0, String(entityId));
 }
 
 /* ── Donor profile view ── */
@@ -349,7 +364,7 @@ async function loadDonor(name) {
       view.appendChild(lbl);
       const list = mk("div", "donor-list");
       view.appendChild(list);
-      renderDonorRows(edata.donors, edata.total_raised, list, new Set([String(data.linked_entity_id)]), 0);
+      renderDonorRows(edata.donors, edata.total_raised, list, new Set([String(data.linked_entity_id)]), 0, String(data.linked_entity_id));
     }
   }
 
@@ -360,7 +375,7 @@ async function loadDonor(name) {
     view.appendChild(lbl);
     const list = mk("div", "sub-list");
     view.appendChild(list);
-    renderGivenRows(data.given, list, new Set(), 0);
+    renderGivenRows(data.given, list, new Set(), 0, data.name);
   }
 
   if (!data.given || !data.given.length) {
@@ -369,24 +384,24 @@ async function loadDonor(name) {
 }
 
 /* ── Render donor rows into a container ── */
-function renderDonorRows(donors, totalRaised, container, visited, depth) {
+function renderDonorRows(donors, totalRaised, container, visited, depth, entityId) {
   const PAGE = 30;
   const slice = donors.slice(0, PAGE);
-  slice.forEach(d => container.appendChild(makeDonorRow(d, totalRaised, visited, depth)));
+  slice.forEach(d => container.appendChild(makeDonorRow(d, totalRaised, visited, depth, entityId)));
 
   if (donors.length > PAGE) {
     const btn = mk("div", "show-more");
     btn.textContent = `Show ${donors.length - PAGE} more donors`;
     btn.addEventListener("click", () => {
       btn.remove();
-      donors.slice(PAGE).forEach(d => container.appendChild(makeDonorRow(d, totalRaised, visited, depth)));
+      donors.slice(PAGE).forEach(d => container.appendChild(makeDonorRow(d, totalRaised, visited, depth, entityId)));
     });
     container.appendChild(btn);
   }
 }
 
 /* ── Build a single donor row with two independent expand buttons ── */
-function makeDonorRow(donor, totalRaised, visited, depth) {
+function makeDonorRow(donor, totalRaised, visited, depth, entityId) {
   const pct = totalRaised > 0 ? Math.round(donor.total / totalRaised * 100) : 0;
   const linked = !!donor.linked_entity_id;
   const row = mk("div", "donor-row");
@@ -405,7 +420,35 @@ function makeDonorRow(donor, totalRaised, visited, depth) {
   barWrap.innerHTML = `<div class="d-bar-bg"><div class="d-bar-fill" style="width:${pct}%"></div></div>`;
 
   const amt = mk("div", "d-amt");
-  amt.innerHTML = `<div class="d-total">${fmt(donor.total)}</div><div class="d-gifts">${donor.gifts} gift${donor.gifts !== 1 ? "s" : ""}</div>`;
+  if (donor.gifts === 1) {
+    amt.innerHTML = `<div class="d-total">${fmt(donor.total)}</div><div class="d-gifts">${fmtDate(donor.first_date)}</div>`;
+  } else {
+    amt.innerHTML = `<div class="d-total">${fmt(donor.total)}</div><div class="d-gifts">${donor.gifts} gifts</div>`;
+    if (entityId) {
+      const toggle = mk("button", "date-toggle");
+      toggle.textContent = "▸ dates";
+      amt.appendChild(toggle);
+      const dateList = mk("div", "date-list");
+      amt.appendChild(dateList);
+      let loaded = false;
+      toggle.addEventListener("click", async e => {
+        e.stopPropagation();
+        const open = dateList.classList.toggle("open");
+        toggle.textContent = open ? "▾ dates" : "▸ dates";
+        if (open && !loaded) {
+          loaded = true;
+          dateList.innerHTML = '<span style="color:var(--text3);font-size:11px">Loading…</span>';
+          const rows = await apiFetch(`/api/dates?entity_id=${enc(entityId)}&donor_name=${enc(donor.name)}`);
+          dateList.innerHTML = "";
+          rows.forEach(r => {
+            const item = mk("div", "date-item");
+            item.innerHTML = `<span class="di-date">${fmtDate(r.tran_date)}</span><span class="di-amt">${fmt(r.tran_amount)}</span>`;
+            dateList.appendChild(item);
+          });
+        }
+      });
+    }
+  }
 
   const actions = mk("div", "d-actions");
   const main = mk("div", "d-main");
@@ -462,7 +505,7 @@ async function loadEntityFunders(donor, container, visited, depth) {
   lbl.textContent = `Funds received by ${edata.name} — ${fmt(edata.total_raised)} total`;
   sec.appendChild(lbl);
   const subList = mk("div", "sub-list donor-list");
-  renderDonorRows(edata.donors, edata.total_raised, subList, new Set([...visited, eid]), depth + 1);
+  renderDonorRows(edata.donors, edata.total_raised, subList, new Set([...visited, eid]), depth + 1, eid);
   sec.appendChild(subList);
   container.appendChild(sec);
 }
@@ -482,30 +525,30 @@ async function loadDonorGiven(donor, container, visited, depth) {
   lbl.textContent = `${esc(donor.name)} contributed to`;
   sec.appendChild(lbl);
   const subList = mk("div", "sub-list");
-  renderGivenRows(others, subList, visited, depth);
+  renderGivenRows(others, subList, visited, depth, donor.name);
   sec.appendChild(subList);
   container.appendChild(sec);
 }
 
 /* ── Render "also gave to" rows (recipient entities) ── */
-function renderGivenRows(given, container, visited, depth) {
+function renderGivenRows(given, container, visited, depth, donorName) {
   const PAGE = 20;
   const slice = given.slice(0, PAGE);
-  slice.forEach(r => container.appendChild(makeGivenRow(r, container, visited, depth)));
+  slice.forEach(r => container.appendChild(makeGivenRow(r, container, visited, depth, donorName)));
 
   if (given.length > PAGE) {
     const btn = mk("div", "show-more");
     btn.textContent = `Show ${given.length - PAGE} more`;
     btn.addEventListener("click", () => {
       btn.remove();
-      given.slice(PAGE).forEach(r => container.insertBefore(makeGivenRow(r, container, visited, depth), null));
+      given.slice(PAGE).forEach(r => container.insertBefore(makeGivenRow(r, container, visited, depth, donorName), null));
     });
     container.appendChild(btn);
   }
 }
 
 /* ── A single "gave to" row with two independent expand buttons ── */
-function makeGivenRow(r, listEl, visited, depth) {
+function makeGivenRow(r, listEl, visited, depth, donorName) {
   const wrap = mk("div");
 
   const row = mk("div", "s-row");
@@ -514,7 +557,37 @@ function makeGivenRow(r, listEl, visited, depth) {
   name.title = "Click to view officers";
   name.addEventListener("click", e => { e.stopPropagation(); openOfficerModal(String(r.entity_id), r.entity_name); });
   const cat  = mk("div", "s-cat");  cat.textContent  = CAT[r.category] || r.category || "";
-  const amt  = mk("div", "s-amt");  amt.textContent  = fmt(r.total);
+
+  const amt = mk("div", "s-amt");
+  if (r.gifts === 1) {
+    amt.innerHTML = `<span>${fmt(r.total)}</span><span class="s-date">${fmtDate(r.first_date)}</span>`;
+  } else {
+    amt.innerHTML = `<span>${fmt(r.total)}</span>`;
+    if (donorName) {
+      const toggle = mk("button", "date-toggle");
+      toggle.textContent = "▸ dates";
+      amt.appendChild(toggle);
+      const dateList = mk("div", "date-list");
+      amt.appendChild(dateList);
+      let loaded = false;
+      toggle.addEventListener("click", async e => {
+        e.stopPropagation();
+        const open = dateList.classList.toggle("open");
+        toggle.textContent = open ? "▾ dates" : "▸ dates";
+        if (open && !loaded) {
+          loaded = true;
+          dateList.innerHTML = '<span style="color:var(--text3);font-size:11px">Loading…</span>';
+          const rows = await apiFetch(`/api/dates?entity_id=${enc(String(r.entity_id))}&donor_name=${enc(donorName)}`);
+          dateList.innerHTML = "";
+          rows.forEach(tx => {
+            const item = mk("div", "date-item");
+            item.innerHTML = `<span class="di-date">${fmtDate(tx.tran_date)}</span><span class="di-amt">${fmt(tx.tran_amount)}</span>`;
+            dateList.appendChild(item);
+          });
+        }
+      });
+    }
+  }
   const actions = mk("div", "d-actions");
 
   const btnF = mk("button", "act-btn"); btnF.textContent = "↑ funded by";
@@ -544,7 +617,7 @@ function makeGivenRow(r, listEl, visited, depth) {
       lbl.textContent = `${esc(edata.name)} — ${fmt(edata.total_raised)} raised, ${edata.donors.length} donors`;
       secF.appendChild(lbl);
       const innerList = mk("div", "donor-list");
-      renderDonorRows(edata.donors, edata.total_raised, innerList, new Set([...visited, String(r.entity_id)]), depth + 1);
+      renderDonorRows(edata.donors, edata.total_raised, innerList, new Set([...visited, String(r.entity_id)]), depth + 1, String(r.entity_id));
       secF.appendChild(innerList);
     }
   });
@@ -572,7 +645,7 @@ function makeGivenRow(r, listEl, visited, depth) {
       lbl.textContent = `${esc(r.entity_name)} contributed to`;
       secG.appendChild(lbl);
       const subList = mk("div", "sub-list");
-      renderGivenRows(others, subList, new Set([...visited, String(r.entity_id)]), depth + 1);
+      renderGivenRows(others, subList, new Set([...visited, String(r.entity_id)]), depth + 1, r.entity_name);
       secG.appendChild(subList);
     }
   });

@@ -38,8 +38,12 @@ async def lifespan(app: FastAPI):
             raise RuntimeError("DB not found and DB_DRIVE_ID env var not set")
         print(f"Downloading database from Google Drive ({DB_DRIVE_ID})...")
         import gdown
-        gdown.download(id=DB_DRIVE_ID, output=str(DB), quiet=False)
-        print("Download complete.")
+        gdown.download(id=DB_DRIVE_ID, output=str(DB), quiet=False, fuzzy=True)
+        # Verify it's a real SQLite file
+        if DB.stat().st_size < 1_000_000:
+            DB.unlink()
+            raise RuntimeError(f"Downloaded file is too small ({DB.stat().st_size} bytes) — likely a Google Drive warning page, not the DB")
+        print(f"Download complete ({DB.stat().st_size / 1e6:.0f} MB).")
     con = sqlite3.connect(DB)
     for eid, name in con.execute("SELECT entity_id, name FROM entities"):
         _names[str(eid)] = name
@@ -133,6 +137,7 @@ def entity_donors(entity_id: str):
         SELECT name,
                SUM(tran_amount) AS total,
                COUNT(*)         AS gifts,
+               MIN(tran_date)   AS first_date,
                MAX(address1)    AS addr,
                MAX(city)        AS city,
                MAX(state)       AS state
@@ -152,6 +157,7 @@ def entity_donors(entity_id: str):
             "name":             r["name"],
             "total":            r["total"],
             "gifts":            r["gifts"],
+            "first_date":       r["first_date"],
             "address":          addr,
             "linked_entity_id": resolve(r["name"]),
         })
@@ -207,7 +213,7 @@ def donor_given(name: str):
                e.category_slug AS category,
                SUM(t.tran_amount) AS total,
                COUNT(*)           AS gifts,
-               MAX(t.tran_date)   AS last_date
+               MIN(t.tran_date)   AS first_date
         FROM   transactions t
         JOIN   entities e ON t.entity_id = e.entity_id
         WHERE  t.name IN ({placeholders})
@@ -222,6 +228,22 @@ def donor_given(name: str):
         "linked_entity_id": resolve(name),
         "given":            [dict(r) for r in rows],
     }
+
+
+@app.get("/api/dates")
+def transaction_dates(entity_id: str, donor_name: str):
+    con = _db()
+    rows = con.execute("""
+        SELECT tran_date, tran_amount
+        FROM   transactions
+        WHERE  entity_id = ?
+          AND  LOWER(TRIM(name)) = LOWER(TRIM(?))
+          AND  tran_type = 'Contribution'
+          AND  tran_amount > 0
+        ORDER  BY tran_date
+    """, (entity_id, donor_name)).fetchall()
+    con.close()
+    return [dict(r) for r in rows]
 
 
 def _fetch_officers_sync(entity_id: str) -> list[dict]:
