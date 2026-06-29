@@ -334,3 +334,8 @@ async def entity_officers(entity_id: str):
 @app.get("/")
 def index():
     return FileResponse(HTML)
+
+@app.head("/")
+def index_head():
+    from fastapi.responses import Response
+    return Response()
