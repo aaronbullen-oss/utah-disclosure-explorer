@@ -372,7 +372,7 @@ async def entity_officers(entity_id: str):
 
 @app.get("/")
 def index():
-    return FileResponse(HTML)
+    return FileResponse(HTML, headers={"Cache-Control": "no-cache, must-revalidate"})
 
 @app.head("/")
 def index_head():
