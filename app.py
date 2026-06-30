@@ -54,6 +54,21 @@ async def lifespan(app: FastAPI):
         CREATE INDEX IF NOT EXISTS idx_t_type     ON transactions(tran_type);
         CREATE INDEX IF NOT EXISTS idx_t_namelc   ON transactions(LOWER(TRIM(name)));
         CREATE INDEX IF NOT EXISTS idx_t_amount   ON transactions(tran_amount);
+        CREATE TABLE IF NOT EXISTS officers (
+            entity_id TEXT NOT NULL,
+            role      TEXT,
+            name      TEXT,
+            address   TEXT,
+            phone     TEXT,
+            email     TEXT
+        );
+        CREATE INDEX IF NOT EXISTS idx_officers_entity ON officers(entity_id);
+        CREATE TABLE IF NOT EXISTS officer_scrape_status (
+            entity_id  TEXT PRIMARY KEY,
+            status     TEXT NOT NULL,
+            error_msg  TEXT,
+            scraped_at TEXT NOT NULL
+        );
     """)
     con.commit()
     con.close()
@@ -354,19 +369,51 @@ async def entity_officers(entity_id: str):
     ent = con.execute(
         "SELECT name, folder_id FROM entities WHERE entity_id=?", (entity_id,)
     ).fetchone()
-    con.close()
     if not ent:
+        con.close()
         return {"error": "not found", "officers": []}
 
     filing_url = f"{BASE}/Search/PublicSearch/FolderDetails/{ent['folder_id']}"
 
-    if entity_id not in _officer_cache:
-        _officer_cache[entity_id] = await asyncio.to_thread(_fetch_officers_sync, entity_id)
+    # Prefer the DB (populated by scrape_officers.py) -- instant, and
+    # doesn't depend on disclosures.utah.gov being responsive right now.
+    status_row = con.execute(
+        "SELECT status FROM officer_scrape_status WHERE entity_id = ?", (entity_id,)
+    ).fetchone()
+    if status_row and status_row["status"] == "ok":
+        rows = con.execute(
+            "SELECT role, name, address, phone, email FROM officers WHERE entity_id = ?",
+            (entity_id,),
+        ).fetchall()
+        con.close()
+        officers = []
+        for r in rows:
+            o = {"role": r["role"]}
+            if r["name"]:    o["name"] = r["name"]
+            if r["address"]: o["address"] = r["address"]
+            if r["phone"]:   o["phone"] = r["phone"]
+            if r["email"]:   o["email"] = r["email"]
+            officers.append(o)
+        return {"name": ent["name"], "filing_url": filing_url, "officers": officers}
+    con.close()
+
+    # Not scraped yet (or last scrape attempt failed) -- fall back to a
+    # live fetch, same as before the batch scraper existed.
+    if entity_id in _officer_cache:
+        officers = _officer_cache[entity_id]
+    else:
+        officers = await asyncio.to_thread(_fetch_officers_sync, entity_id)
+        # Don't cache transient fetch failures (e.g. upstream timeout) --
+        # only cache real results so a later retry can succeed once the
+        # state site recovers, instead of being stuck on the cached error
+        # for the lifetime of this server process.
+        if not (len(officers) == 1 and "error" in officers[0]):
+            _officer_cache[entity_id] = officers
 
     return {
         "name":       ent["name"],
         "filing_url": filing_url,
-        "officers":   _officer_cache[entity_id],
+        "officers":   officers,
     }
 
 

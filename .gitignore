@@ -9,4 +9,5 @@ build_*.py
 clean_addresses.py
 geocode_donors.py
 scrape.py
+scrape_officers.py
 GeocodeMap.gs
