@@ -63,6 +63,36 @@ html, body { height: 100%; font-family: system-ui, -apple-system, sans-serif; fo
 .r-linked { font-size: 10px; padding: 1px 5px; border-radius: 3px; background: var(--accentL);
             color: var(--accent); font-weight: 500; margin-left: 4px; vertical-align: middle; }
 
+/* ── Sidebar mode toggle (Search / Browse) ── */
+.mode-toggle { display: flex; gap: 4px; margin-top: 10px; }
+.mode-btn    { flex: 1; padding: 5px 0; font-size: 11px; font-weight: 600; text-align: center;
+               border: 1px solid var(--border2); border-radius: 6px; background: var(--bg2);
+               color: var(--text2); cursor: pointer; font-family: inherit; }
+.mode-btn.active { background: var(--accentL); color: var(--accent); border-color: var(--accent); }
+
+/* ── Browse sub-toggle (Type / Layer) ── */
+.browse-subtoggle { display: flex; gap: 4px; padding: 8px 14px 6px; border-bottom: 1px solid var(--border); }
+.sub-btn { flex: 1; padding: 4px 0; font-size: 10px; font-weight: 600; text-align: center;
+           border: 1px solid var(--border2); border-radius: 5px; background: var(--bg);
+           color: var(--text2); cursor: pointer; font-family: inherit; }
+.sub-btn.active { background: var(--accentL); color: var(--accent); border-color: var(--accent); }
+
+/* ── Browse groups ── */
+.browse-group-hdr { display: flex; align-items: center; gap: 6px; padding: 8px 14px; cursor: pointer;
+                     font-size: 12px; font-weight: 600; color: var(--text); background: var(--bg2);
+                     border-bottom: 1px solid var(--border); user-select: none; }
+.browse-group-hdr:hover { background: var(--bg3); }
+.browse-group-hdr .bg-arrow { font-size: 9px; color: var(--text2); transition: transform 0.15s; display: inline-block; }
+.browse-group-hdr.open .bg-arrow { transform: rotate(90deg); }
+.browse-group-count { margin-left: auto; font-size: 11px; font-weight: 400; color: var(--text2); }
+.browse-group-body { display: none; }
+.browse-group-body.open { display: block; }
+.browse-item { padding: 6px 14px 6px 26px; font-size: 12px; cursor: pointer; border-bottom: 1px solid var(--border); }
+.browse-item:hover { background: var(--bg2); }
+.browse-item.active { background: var(--accentL); color: var(--accent); }
+#browse-panel { display: none; flex-direction: column; flex: 1; overflow-y: auto; }
+#browse-panel.show { display: flex; }
+
 /* ── Entity header ── */
 .ent-hdr   { margin-bottom: 22px; }
 .ent-name  { font-size: 22px; font-weight: 600; line-height: 1.2; margin-bottom: 8px; }
@@ -192,9 +222,20 @@ html, body { height: 100%; font-family: system-ui, -apple-system, sans-serif; fo
     <div class="sidebar-top">
       <div class="app-title">Utah Disclosures</div>
       <input id="search" type="text" placeholder="Search entities…" autocomplete="off" spellcheck="false">
+      <div class="mode-toggle">
+        <button class="mode-btn active" id="modeSearch">Search</button>
+        <button class="mode-btn" id="modeBrowse">Browse</button>
+      </div>
     </div>
     <div id="search-results">
       <div class="empty">Type to search 4,454 entities</div>
+    </div>
+    <div id="browse-panel">
+      <div class="browse-subtoggle">
+        <button class="sub-btn active" id="browseByType">By Type</button>
+        <button class="sub-btn" id="browseByLayer">By Layer</button>
+      </div>
+      <div id="browse-results"></div>
     </div>
   </aside>
 
@@ -293,6 +334,87 @@ async function doSearch(q) {
       el.appendChild(div);
     });
   }
+}
+
+/* ── Sidebar mode toggle (Search / Browse) ── */
+const LAYER_ORDER = [
+  "Republican Party", "Democrat Party", "LGBT Causes", "Pro-Abortion",
+  "Banking", "Insurance", "Real Estate", "Construction",
+  "Labor Unions", "Teachers Unions",
+];
+
+let _browseMode = "type"; // "type" | "layer"
+let _browseCacheType = null, _browseCacheLayer = null;
+let _activeBrowseItem = null;
+let _browseSeq = 0;
+
+document.getElementById("modeSearch").addEventListener("click", () => setSidebarMode("search"));
+document.getElementById("modeBrowse").addEventListener("click", () => setSidebarMode("browse"));
+document.getElementById("browseByType").addEventListener("click", () => setBrowseMode("type"));
+document.getElementById("browseByLayer").addEventListener("click", () => setBrowseMode("layer"));
+
+function setSidebarMode(mode) {
+  document.getElementById("modeSearch").classList.toggle("active", mode === "search");
+  document.getElementById("modeBrowse").classList.toggle("active", mode === "browse");
+  document.getElementById("search-results").style.display = mode === "search" ? "" : "none";
+  document.getElementById("browse-panel").classList.toggle("show", mode === "browse");
+  if (mode === "browse") loadBrowse();
+}
+
+function setBrowseMode(mode) {
+  _browseMode = mode;
+  document.getElementById("browseByType").classList.toggle("active", mode === "type");
+  document.getElementById("browseByLayer").classList.toggle("active", mode === "layer");
+  loadBrowse();
+}
+
+async function loadBrowse() {
+  const seq = ++_browseSeq;
+  const el = document.getElementById("browse-results");
+  const isType = _browseMode === "type";
+  let groups = isType ? _browseCacheType : _browseCacheLayer;
+
+  if (!groups) {
+    el.innerHTML = '<div class="loading" style="padding:10px 14px">Loading…</div>';
+    groups = await apiFetch(isType ? "/api/entities/browse" : "/api/entities/layers");
+    if (seq !== _browseSeq) return; // stale — a newer browse request already fired
+    if (isType) _browseCacheType = groups; else _browseCacheLayer = groups;
+  }
+  if (seq !== _browseSeq) return;
+
+  el.innerHTML = "";
+  const order = isType
+    ? Object.keys(groups).sort()
+    : LAYER_ORDER.filter(l => groups[l]);
+
+  order.forEach(groupName => {
+    const items = groups[groupName] || [];
+    if (!items.length) return;
+
+    const hdr = mk("div", "browse-group-hdr");
+    hdr.innerHTML = `<span class="bg-arrow">▸</span> ${esc(isType ? (CAT[groupName] || groupName) : groupName)}
+                      <span class="browse-group-count">${items.length}</span>`;
+    el.appendChild(hdr);
+
+    const body = mk("div", "browse-group-body");
+    items.forEach(it => {
+      const row = mk("div", "browse-item");
+      row.textContent = it.name;
+      row.addEventListener("click", () => {
+        if (_activeBrowseItem) _activeBrowseItem.classList.remove("active");
+        row.classList.add("active");
+        _activeBrowseItem = row;
+        loadEntity(it.entity_id);
+      });
+      body.appendChild(row);
+    });
+    el.appendChild(body);
+
+    hdr.addEventListener("click", () => {
+      const open = body.classList.toggle("open");
+      hdr.classList.toggle("open", open);
+    });
+  });
 }
 
 /* ── Entity view ── */

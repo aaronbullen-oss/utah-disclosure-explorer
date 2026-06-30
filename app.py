@@ -107,6 +107,45 @@ def _name_variants(name: str, con: sqlite3.Connection, threshold: float = 0.92) 
     return matches or [name]
 
 
+@app.get("/api/entities/browse")
+def entities_browse():
+    """All entities grouped by category_slug, alphabetical within each group."""
+    con = _db()
+    rows = con.execute(
+        "SELECT entity_id, name, category_slug FROM entities ORDER BY category_slug, name COLLATE NOCASE"
+    ).fetchall()
+    con.close()
+    groups: dict[str, list] = {}
+    for r in rows:
+        groups.setdefault(r["category_slug"] or "OTHER", []).append(
+            {"entity_id": str(r["entity_id"]), "name": r["name"]}
+        )
+    return groups
+
+
+@app.get("/api/entities/layers")
+def entities_layers():
+    """All tagged entities grouped by donor-map layer, alphabetical within each group.
+
+    Sourced from entity_layer_tags (see tag_entity_layers.py). LGBT Causes and
+    Pro-Abortion are not included — no entity-name list exists for them yet.
+    """
+    con = _db()
+    rows = con.execute("""
+        SELECT t.layer_tag, e.entity_id, e.name
+        FROM entity_layer_tags t
+        JOIN entities e ON e.entity_id = t.entity_id
+        ORDER BY t.layer_tag, e.name COLLATE NOCASE
+    """).fetchall()
+    con.close()
+    groups: dict[str, list] = {}
+    for r in rows:
+        groups.setdefault(r["layer_tag"], []).append(
+            {"entity_id": str(r["entity_id"]), "name": r["name"]}
+        )
+    return groups
+
+
 @app.get("/api/search")
 def search(q: str = "", limit: int = 40):
     if not q:
