@@ -36,6 +36,11 @@ LAYER_CSV_MAP = {
     'Construction':     'construction_donors_geocoded.csv',
     'Labor Unions':     'labor_union_donors_geocoded.csv',
     'Teachers Unions':  'teacher_union_donors_geocoded.csv',
+    'Manufacturing':    'manufacturing_donors_geocoded.csv',
+    'Healthcare':       'healthcare_donors_geocoded.csv',
+    'Libertarian Party':  'libertarian_donors_geocoded.csv',
+    'Constitution Party': 'constitution_donors_geocoded.csv',
+    'Green Party':      'green_donors_geocoded.csv',
 }
 
 def main():
