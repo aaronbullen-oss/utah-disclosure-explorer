@@ -811,10 +811,21 @@ function openOfficerModal(entityId, name) {
       roleEl.textContent = o.role || "Officer";
       content.appendChild(roleEl);
       const grid = mk("div", "kv-grid");
-      [["name","Name"],["address","Address"],["phone","Phone"],["email","Email"]].forEach(([key, label]) => {
+      [
+        ["name","Name"], ["title","Title"], ["occupation","Occupation"],
+        ["address","Address"], ["business_address","Business Address"],
+        ["phone","Phone"], ["email","Email"],
+      ].forEach(([key, label]) => {
         if (!o[key]) return;
         const lbl = mk("div", "kv-label"); lbl.textContent = label + ":";
         const val = mk("div", "kv-value"); val.textContent = o[key];
+        grid.appendChild(lbl); grid.appendChild(val);
+      });
+      // Fields not in the standard set above (Office, District #, Party,
+      // County of Election, Date Created, etc. -- varies by entity category)
+      (o.extra || []).forEach(({label, value}) => {
+        const lbl = mk("div", "kv-label"); lbl.textContent = label + ":";
+        const val = mk("div", "kv-value"); val.textContent = value;
         grid.appendChild(lbl); grid.appendChild(val);
       });
       content.appendChild(grid);

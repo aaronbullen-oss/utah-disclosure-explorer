@@ -15,6 +15,54 @@ from pathlib import Path
 BASE = "https://disclosures.utah.gov"
 _officer_cache: dict[str, list] = {}
 
+
+def ensure_officer_tables(cur):
+    """Create the officers/officer_extra/officer_scrape_status tables.
+
+    Migration: if an `officers` table exists from before the parser fix
+    (single flat record per fieldset, no title/occupation/business_address
+    columns), drop and rebuild it -- that old data silently dropped extra
+    people within a fieldset (see _fetch_officers_sync docstring), so there's
+    nothing worth preserving from it.
+    """
+    table_exists = cur.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='officers'"
+    ).fetchone()
+    cols = [r[1] for r in cur.execute("PRAGMA table_info(officers)").fetchall()] if table_exists else []
+    if table_exists and "title" not in cols:
+        cur.executescript("""
+            DROP TABLE IF EXISTS officer_extra;
+            DROP TABLE IF EXISTS officers;
+            DROP TABLE IF EXISTS officer_scrape_status;
+        """)
+    cur.executescript("""
+        CREATE TABLE IF NOT EXISTS officers (
+            id          INTEGER PRIMARY KEY AUTOINCREMENT,
+            entity_id   TEXT NOT NULL,
+            role        TEXT,
+            name        TEXT,
+            title       TEXT,
+            address     TEXT,
+            phone       TEXT,
+            email       TEXT,
+            occupation  TEXT,
+            business_address TEXT
+        );
+        CREATE INDEX IF NOT EXISTS idx_officers_entity ON officers(entity_id);
+        CREATE TABLE IF NOT EXISTS officer_extra (
+            officer_id INTEGER NOT NULL REFERENCES officers(id),
+            label      TEXT,
+            value      TEXT
+        );
+        CREATE INDEX IF NOT EXISTS idx_officer_extra_officer ON officer_extra(officer_id);
+        CREATE TABLE IF NOT EXISTS officer_scrape_status (
+            entity_id  TEXT PRIMARY KEY,
+            status     TEXT NOT NULL,
+            error_msg  TEXT,
+            scraped_at TEXT NOT NULL
+        );
+    """)
+
 DB   = Path(__file__).parent / "utah_disclosures.db"
 HTML = Path(__file__).parent / "index.html"
 
@@ -54,22 +102,8 @@ async def lifespan(app: FastAPI):
         CREATE INDEX IF NOT EXISTS idx_t_type     ON transactions(tran_type);
         CREATE INDEX IF NOT EXISTS idx_t_namelc   ON transactions(LOWER(TRIM(name)));
         CREATE INDEX IF NOT EXISTS idx_t_amount   ON transactions(tran_amount);
-        CREATE TABLE IF NOT EXISTS officers (
-            entity_id TEXT NOT NULL,
-            role      TEXT,
-            name      TEXT,
-            address   TEXT,
-            phone     TEXT,
-            email     TEXT
-        );
-        CREATE INDEX IF NOT EXISTS idx_officers_entity ON officers(entity_id);
-        CREATE TABLE IF NOT EXISTS officer_scrape_status (
-            entity_id  TEXT PRIMARY KEY,
-            status     TEXT NOT NULL,
-            error_msg  TEXT,
-            scraped_at TEXT NOT NULL
-        );
     """)
+    ensure_officer_tables(con.cursor())
     con.commit()
     con.close()
     yield
@@ -301,10 +335,27 @@ def transaction_dates(entity_id: str, donor_name: str):
 
 
 def _fetch_officers_sync(entity_id: str) -> list[dict]:
-    """Fetch officer info from /Registration/EntityDetails/{entity_id}.
+    """Fetch officer/registration info from /Registration/EntityDetails/{entity_id}.
 
     Page structure: <fieldset><legend>Information about the X</legend>
-    followed by <div class="dis-cell"><label>Field</label>Value</div> rows.
+    containing <div class="dis-cell"><label>Field</label>Value</div> rows.
+
+    IMPORTANT: a single fieldset can list MULTIPLE people under one legend
+    (e.g. "all other Officers" lists every additional officer one after
+    another). The "First" label reliably marks the start of each new
+    person's fields, so records are split there rather than treating the
+    whole fieldset as one flat dict -- the latter silently overwrote all
+    but the last person in any multi-person fieldset.
+
+    A person's block can also contain a "Business Address" sub-block that
+    reuses the City/State/Zip/Suite labels from the mailing address; those
+    are captured separately (prefixed "Business ...") once "Business
+    Address" is seen, so they don't clobber the mailing address fields.
+
+    Fields not otherwise recognized (Title, Occupation, Office, District #,
+    Party, County of Election, Date Created, etc. -- these vary by entity
+    category) are preserved generically in "extra" so nothing on the
+    Statement of Organization is silently dropped.
     """
     url = f"{BASE}/Registration/EntityDetails/{entity_id}"
     req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
@@ -319,19 +370,54 @@ def _fetch_officers_sync(entity_id: str) -> list[dict]:
     def strip_tags(s):
         return re.sub(r'\s+', ' ', re.sub(r'<[^>]+>', ' ', s)).strip()
 
+    KNOWN_LABELS = {
+        "First", "Middle", "Last", "Suffix", "Title",
+        "Street Address", "Suite/PO Box", "City", "State", "Zip",
+        "Telephone Number", "Email", "Occupation",
+    }
+
+    def build_officer(role, fields, extra):
+        name = " ".join(fields[k] for k in ("First", "Middle", "Last", "Suffix") if fields.get(k))
+        addr = ", ".join(filter(None, [
+            fields.get("Street Address", ""),
+            fields.get("Suite/PO Box", ""),
+            fields.get("City", ""),
+            " ".join(filter(None, [fields.get("State", ""), fields.get("Zip", "")])),
+        ]))
+        biz_addr = ", ".join(filter(None, [
+            fields.get("Business Street Address", ""),
+            fields.get("Business Suite/PO Box", ""),
+            fields.get("Business City", ""),
+            " ".join(filter(None, [fields.get("Business State", ""), fields.get("Business Zip", "")])),
+        ]))
+        officer: dict = {"role": role}
+        if name:                            officer["name"] = name
+        if fields.get("Title"):             officer["title"] = fields["Title"]
+        if addr:                            officer["address"] = addr
+        if fields.get("Telephone Number"):  officer["phone"] = fields["Telephone Number"]
+        if fields.get("Email"):             officer["email"] = fields["Email"]
+        if fields.get("Occupation"):        officer["occupation"] = fields["Occupation"]
+        if biz_addr:                        officer["business_address"] = biz_addr
+        if extra:                           officer["extra"] = extra
+        return officer
+
     officers = []
     for fs in re.finditer(r'<fieldset[^>]*>(.*?)</fieldset>', html, re.DOTALL | re.I):
         fs_html = fs.group(1)
         leg = re.search(r'<legend[^>]*>([^<]+)</legend>', fs_html, re.I)
         if not leg:
             continue
-        # Only process fieldsets that have a person's Last name field
+        # Only process fieldsets that describe at least one person
         if not re.search(r'<label[^>]*>\s*Last\s*</label>', fs_html, re.I):
             continue
 
         role = re.sub(r'(?i)information about (the )?', '', leg.group(1)).strip()
 
         fields: dict[str, str] = {}
+        extra: list[dict[str, str]] = []
+        business_mode = False
+        started = False
+
         for cell in re.finditer(
             r'<div[^>]*class="[^"]*dis-cell[^"]*"[^>]*>(.*?)</div>',
             fs_html, re.DOTALL | re.I,
@@ -342,23 +428,28 @@ def _fetch_officers_sync(entity_id: str) -> list[dict]:
                 continue
             label = lbl.group(1).strip()
             value = strip_tags(re.sub(r'<label[^>]*>[^<]*</label>', '', cell_html, flags=re.I))
-            if value:
+
+            if label == "First":
+                if started:
+                    officers.append(build_officer(role, fields, extra))
+                fields, extra, business_mode = {}, [], False
+                started = True
+
+            if not value:
+                continue
+
+            if label == "Business Address":
+                business_mode = True
+                fields["Business Street Address"] = value
+            elif business_mode and label in ("Suite/PO Box", "City", "State", "Zip"):
+                fields[f"Business {label}"] = value
+            elif label in KNOWN_LABELS:
                 fields[label] = value
+            else:
+                extra.append({"label": label, "value": value})
 
-        name = " ".join(fields[k] for k in ("First", "Middle", "Last", "Suffix") if fields.get(k))
-        addr = ", ".join(filter(None, [
-            fields.get("Street Address", ""),
-            fields.get("Suite/PO Box", ""),
-            fields.get("City", ""),
-            " ".join(filter(None, [fields.get("State", ""), fields.get("Zip", "")])),
-        ]))
-
-        officer: dict[str, str] = {"role": role}
-        if name:    officer["name"]    = name
-        if addr:    officer["address"] = addr
-        if fields.get("Phone"): officer["phone"] = fields["Phone"]
-        if fields.get("Email"): officer["email"] = fields["Email"]
-        officers.append(officer)
+        if started:
+            officers.append(build_officer(role, fields, extra))
 
     return officers
 
@@ -382,18 +473,27 @@ async def entity_officers(entity_id: str):
     ).fetchone()
     if status_row and status_row["status"] == "ok":
         rows = con.execute(
-            "SELECT role, name, address, phone, email FROM officers WHERE entity_id = ?",
+            "SELECT id, role, name, title, address, phone, email, occupation, business_address "
+            "FROM officers WHERE entity_id = ?",
             (entity_id,),
         ).fetchall()
-        con.close()
         officers = []
         for r in rows:
             o = {"role": r["role"]}
-            if r["name"]:    o["name"] = r["name"]
-            if r["address"]: o["address"] = r["address"]
-            if r["phone"]:   o["phone"] = r["phone"]
-            if r["email"]:   o["email"] = r["email"]
+            if r["name"]:              o["name"] = r["name"]
+            if r["title"]:             o["title"] = r["title"]
+            if r["address"]:           o["address"] = r["address"]
+            if r["phone"]:             o["phone"] = r["phone"]
+            if r["email"]:             o["email"] = r["email"]
+            if r["occupation"]:        o["occupation"] = r["occupation"]
+            if r["business_address"]:  o["business_address"] = r["business_address"]
+            extras = con.execute(
+                "SELECT label, value FROM officer_extra WHERE officer_id = ?", (r["id"],)
+            ).fetchall()
+            if extras:
+                o["extra"] = [{"label": x["label"], "value": x["value"]} for x in extras]
             officers.append(o)
+        con.close()
         return {"name": ent["name"], "filing_url": filing_url, "officers": officers}
     con.close()
 
